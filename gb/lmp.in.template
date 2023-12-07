@@ -1,0 +1,55 @@
+units metal
+boundary {bc}
+atom_style atomic
+
+{read_data}
+
+# Output every nsteps
+variable nsteps    equal 10
+
+# Dump every dumpsteps
+variable dumpsteps equal 100000
+
+# Potential
+pair_style      {pot_type}
+pair_coeff      * * {pot_file} {host_element} {second_element}
+
+mass            1 {host_element_mass} # {host_element}
+mass            2 {second_element_mass} # {second_element}
+
+timestep 0.002
+
+
+# Set up ensemble
+{velocity}
+{base_ensemble}
+fix             2 all sgcmc {mc_every} {mc_steps} {T} {dmu}
+
+# Avoid total momentum during equilibration.
+fix             98 all momentum 100 linear 1 1 1 angular
+
+
+# Output
+variable        c{host_element} equal "f_2[3]"
+variable        c{second_element} equal "f_2[4]"
+variable        denom_tmp equal "f_2[1] + f_2[2]"
+variable        denom equal "v_denom_tmp + (v_denom_tmp == 0)"  # ensure > 0
+variable        acceptance equal "f_2[1] / v_denom"
+
+thermo_style    custom step temp pe ke etotal enthalpy press vol       &
+                lx ly lz xy xz yz pxx pyy pzz pxy pxz pyz atoms        &
+                v_c{host_element} v_c{second_element} v_acceptance &
+                cpu cpuremain
+thermo_modify   norm no  flush yes
+thermo          ${{nsteps}}
+
+dump            MyDump all custom/gz ${{dumpsteps}} structure.dump.*.gz &
+                id type x y z vx vy vz ix iy iz
+dump_modify     MyDump pad 10
+
+
+# Run.
+run             500000                # 1 ns
+write_data      end_run.data
+
+minimize        1e-6 1e-6 10000 100000

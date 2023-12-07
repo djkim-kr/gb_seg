@@ -1,0 +1,183 @@
+units           metal
+boundary        {bc}
+atom_style      atomic
+
+read_data       ../end_run.data.gz
+
+# Total runtime
+variable        nsteps    equal 500000  # 1ns
+
+# Output every nsteps
+variable        logsteps  equal 10
+
+# Dump every dumpsteps
+variable        dumpsteps equal 5000
+
+# Potential
+pair_style      {pot_type}
+pair_coeff      * * {pot_file} {host_element} {second_element}
+
+mass            1 {host_element_mass} # {host_element}
+mass            2 {second_element_mass} # {second_element}
+
+timestep        0.002
+
+
+# Set up boundaries, needed for minimize later (goes into restart files).
+variable        is_top atom "y > yhi - 30"
+variable        is_bot atom "y < ylo + 30"
+variable        region atom "v_is_top - v_is_bot + 2"  # 1 bot, 2 bulk, 3 top
+fix             region all store/state 0 v_region
+
+group           top variable is_top
+group           bot variable is_bot
+group           bulk subtract all top bot
+
+
+# MD/MC ################################################################
+
+# Set up ensemble
+
+{base_ensemble}
+fix             2 all sgcmc {mc_every} {mc_steps} {T} {dmu}
+
+# Avoid total momentum during equilibration.
+fix             98 all momentum 100 linear 1 1 1 angular
+
+# Output
+variable        c{host_element} equal "f_2[3]"
+variable        c{second_element} equal "f_2[4]"
+variable        denom_tmp equal "f_2[1] + f_2[2]"
+variable        denom equal "v_denom_tmp + (v_denom_tmp == 0)"  # ensure > 0
+variable        acceptance equal "f_2[1] / v_denom"
+
+variable        is{second_element} atom "type == 2"
+fix             occup{second_element} all ave/atom 1 ${{nsteps}} ${{nsteps}} v_is{second_element}
+
+thermo_style    custom step temp pe ke etotal enthalpy press vol       &
+                lx ly lz xy xz yz pxx pyy pzz pxy pxz pyz atoms        &
+                v_c{host_element} v_c{second_element} v_acceptance                               &
+                cpu cpuremain
+thermo_modify   norm no  flush yes
+thermo          ${{logsteps}}
+
+dump            MyDump all custom/gz ${{dumpsteps}} structure.dump.*.gz &
+                id type x y z vx vy vz ix iy iz f_region
+dump_modify     MyDump pad 10
+
+dump            OccupDump all custom ${{nsteps}} occupation-{second_element}.dump.*    &
+                id type x y z vx vy vz ix iy iz f_occup{second_element}
+dump_modify     OccupDump pad 10
+
+restart         ${{dumpsteps}} restart.*
+write_restart   restart.0 # This one has to be done manually :-(
+
+# Run.
+run             ${{nsteps}}
+
+write_data      end_run.data
+
+
+# Minimize #############################################################
+
+label           loop
+clear
+variable        i loop 0 100
+
+  variable      step equal "v_i * 5000"
+  variable      steppad format step "%010.0f"
+
+  units         metal
+  boundary      p s p
+  atom_style    atomic
+
+  read_restart  restart.${{step}}
+
+  # Potential
+  pair_style    {pot_type}
+  pair_coeff    * * {pot_file} {host_element} {second_element}
+
+  mass          1 {host_element_mass} # {host_element}
+  mass          2 {second_element_mass} # {second_element}
+
+  timestep      0.002
+
+  # Load boundaries; groups should be preserved in the restart
+  # file. Since store/state somehow claims to restore state, but is
+  # lying, and since there is for some stupid reason no way to test
+  # which group an atom belongs to in an atom-style variable, we'll
+  # use a hack and temporarily encode the group info in the
+  # velocity. Velocity is discarded anyway later.
+  velocity      bot  set 1 0 0
+  velocity      bulk set 2 0 0
+  velocity      top  set 3 0 0
+  variable      region atom vx
+  fix           region all store/state 0 v_region
+
+  # Scale box to zero Kelvin lattice constant. After reading a restart file,
+  # for some godforsaken reason "run 0" is needed before change_box.
+  run           0
+  variable      a equal {a}
+  variable      lx equal "{lx}"
+  variable      lz equal "{lz}"
+  change_box    all  x final 0 ${{lx}}  z final 0 ${{lz}}  remap
+
+  # Remove velocity
+  velocity      all set 0 0 0
+
+  # Compute excess properties
+  variable      Efcc equal {Ecoh}
+  compute       pe all pe/atom
+  variable      excess atom "c_pe - v_Efcc"
+  compute       EgbRaw bulk reduce sum v_excess
+  variable      Egb equal "c_EgbRaw / (lx * lz) * 16.02176634"
+
+  compute       stress all stress/atom NULL
+  compute       tau11raw bulk reduce sum c_stress[1]
+  compute       tau22raw bulk reduce sum c_stress[2]
+  compute       tau33raw bulk reduce sum c_stress[3]
+  compute       tau12raw bulk reduce sum c_stress[4]
+  compute       tau31raw bulk reduce sum c_stress[5]
+  compute       tau23raw bulk reduce sum c_stress[6]
+
+  variable      tau11 equal "c_tau11raw  / (lx * lz) * 1e-05"
+  variable      tau22 equal "c_tau22raw  / (lx * lz) * 1e-05"
+  variable      tau33 equal "c_tau33raw  / (lx * lz) * 1e-05"
+  variable      tau12 equal "c_tau12raw  / (lx * lz) * 1e-05"
+  variable      tau31 equal "c_tau31raw  / (lx * lz) * 1e-05"
+  variable      tau23 equal "c_tau23raw  / (lx * lz) * 1e-05"
+
+  # Note: this needs the VORONOI package in LAMMPS.
+  variable      Vfcc equal "v_a * v_a * v_a / 4"
+  compute       V all voronoi/atom
+  variable      Vexcess atom "c_V[1] - v_Vfcc"
+  compute       VgbRaw bulk reduce sum v_Vexcess
+  variable      Vgb equal "c_VgbRaw / (lx * lz)"
+
+  variable      Agb equal "lx * lz"
+  variable      Nbulk equal "count(bulk)"
+  variable      is{second_element} atom "type == 2"
+  compute       N{second_element} bulk reduce sum v_is{second_element}
+
+  thermo_style  custom step temp pe ke etotal enthalpy press vol       &
+                lx ly lz xy xz yz pxx pyy pzz pxy pxz pyz atoms        &
+                v_Egb v_Vgb                                            &
+                v_tau11 v_tau22 v_tau33 v_tau12 v_tau31 v_tau23        &
+                v_Agb v_Nbulk c_N{second_element}                      &
+                cpu cpuremain
+  thermo_modify norm no  flush yes  format float %20.15g
+  thermo        10
+
+  # Minimize
+  min_style     cg
+  minimize      1e-12 1e-12 10000 100000
+  min_style     hftn
+  minimize      1e-12 1e-12 10000 100000
+
+  reset_timestep ${{step}}
+  run           0
+  write_dump    all custom minimized.dump.${{steppad}}                 &
+                id type x y z ix iy iz f_region c_pe c_V[1]
+
+next            i
+jump            SELF loop
